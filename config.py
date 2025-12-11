@@ -4,10 +4,10 @@ import os
 class Config:
     # Bot Configuration
     BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-    ADMIN_ID = 6764548697
+    ADMIN_ID = os.getenv("ADMIN_IDS")
     
     # Channel Configuration
-    CHANNEL_USERNAME = "Streamx Player"
+    CHANNEL_USERNAME = "Your_Channel_Name"
     CHANNEL_INVITE_LINK = "https://t.me/your_channel_link"
     
     # Payment Configuration
