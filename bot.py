@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 # Configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
-ADMIN_ID = 6764548697  # Your Telegram ID
+ADMIN_ID = os.getenv("ADMIN_IDS","YOUR_ADMIN_IDS")
 CHANNEL_USERNAME = "@your_private_channel"  # Your channel
 CHANNEL_INVITE_LINK = "https://t.me/your_private_channel/123"
 
