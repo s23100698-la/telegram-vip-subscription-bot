@@ -1,649 +1,355 @@
 """
-Utility functions for the subscription bot
+utils.py - Database utilities with thread-local connection pooling
+FIXED VERSION - No premature connection closing
+Added: sqlite3.Row row_factory + channels functions
 """
-
 import sqlite3
-from datetime import datetime, timedelta
+import threading
 import logging
-import json
-import os
-from typing import Dict, List, Optional, Tuple
-from config import Config
+from datetime import datetime, timedelta
+from contextlib import contextmanager
+from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+DB_PATH = "subscriptions.db"  # अगर आपके प्रोजेक्ट में अलग जगह है तो बदल दें
+
 class DatabaseUtils:
-    """Database utility functions"""
+    """Database utility class with thread-local connection pooling."""
     
-    @staticmethod
-    def init_database():
-        """Initialize database with required tables"""
-        conn = sqlite3.connect(Config.DATABASE_NAME)
-        cursor = conn.cursor()
-        
-        # Users table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            first_name TEXT,
-            last_name TEXT,
-            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            subscription_end TIMESTAMP,
-            plan_type TEXT DEFAULT 'free',
-            status TEXT DEFAULT 'active',
-            last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            referred_by INTEGER,
-            referral_code TEXT UNIQUE,
-            total_spent REAL DEFAULT 0,
-            notes TEXT
-        )
-        ''')
-        
-        # Plans table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS plans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE,
-            duration_days INTEGER,
-            price REAL,
-            currency TEXT DEFAULT 'INR',
-            description TEXT,
-            features TEXT,  -- JSON string of features list
-            is_active BOOLEAN DEFAULT 1,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-        
-        # Payments table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            plan_id INTEGER,
-            amount REAL,
-            currency TEXT,
-            payment_method TEXT,
-            transaction_id TEXT UNIQUE,
-            status TEXT DEFAULT 'pending',
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            verified_by INTEGER,
-            verified_at TIMESTAMP,
-            notes TEXT,
-            FOREIGN KEY (user_id) REFERENCES users (user_id),
-            FOREIGN KEY (plan_id) REFERENCES plans (id)
-        )
-        ''')
-        
-        # Referrals table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            referrer_id INTEGER,
-            referred_id INTEGER UNIQUE,
-            commission REAL,
-            status TEXT DEFAULT 'pending',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            completed_at TIMESTAMP,
-            FOREIGN KEY (referrer_id) REFERENCES users (user_id),
-            FOREIGN KEY (referred_id) REFERENCES users (user_id)
-        )
-        ''')
-        
-        # Logs table
-        cursor.execute('''
-        CREATE TABLE IF NOT EXISTS logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            action TEXT,
-            details TEXT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        ''')
-        
-        # Insert default plans
-        cursor.execute("SELECT COUNT(*) FROM plans")
-        if cursor.fetchone()[0] == 0:
-            for plan_data in Config.DEFAULT_PLANS:
-                features_json = json.dumps(plan_data.get('features', []))
-                cursor.execute('''
-                INSERT INTO plans (name, duration_days, price, currency, description, features)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ''', (
-                    plan_data['name'],
-                    plan_data['duration_days'],
-                    plan_data['price'],
-                    plan_data['currency'],
-                    plan_data['description'],
-                    features_json
-                ))
-        
-        conn.commit()
-        conn.close()
-        logger.info("Database initialized successfully")
+    # Thread-local storage for database connections
+    _local = threading.local()
     
     @staticmethod
     def get_connection():
-        """Get database connection"""
-        conn = sqlite3.connect(Config.DATABASE_NAME)
-        conn.row_factory = sqlite3.Row
-        return conn
-    
-    @staticmethod
-    def add_user(user_id: int, username: str, first_name: str, referred_by: int = None):
-        """Add new user to database"""
-        conn = DatabaseUtils.get_connection()
-        cursor = conn.cursor()
-        
-        # Generate referral code
-        referral_code = f"REF{user_id}{int(datetime.now().timestamp()) % 10000}"
-        
-        cursor.execute('''
-        INSERT OR IGNORE INTO users (user_id, username, first_name, referred_by, referral_code, join_date)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ''', (user_id, username, first_name, referred_by, referral_code, datetime.now()))
-        
-        # If user was referred, add to referrals table
-        if referred_by:
-            cursor.execute('''
-            INSERT OR IGNORE INTO referrals (referrer_id, referred_id, status)
-            VALUES (?, ?, 'pending')
-            ''', (referred_by, user_id))
-        
-        conn.commit()
-        conn.close()
-        return referral_code
-    
-    @staticmethod
-    def get_user(user_id: int):
-        """Get user by ID"""
-        conn = DatabaseUtils.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        user = cursor.fetchone()
-        conn.close()
-        return dict(user) if user else None
-    
-    @staticmethod
-    def update_subscription(user_id: int, plan_id: int, duration_days: int):
-        """Update user subscription"""
-        conn = DatabaseUtils.get_connection()
-        cursor = conn.cursor()
-        
-        # Get plan details
-        cursor.execute("SELECT name, price FROM plans WHERE id = ?", (plan_id,))
-        plan = cursor.fetchone()
-        
-        if not plan:
-            conn.close()
-            return False
-        
-        # Calculate new expiry
-        cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (user_id,))
-        current = cursor.fetchone()
-        
-        if current and current['subscription_end']:
-            current_end = datetime.strptime(current['subscription_end'], '%Y-%m-%d %H:%M:%S')
-            if current_end > datetime.now():
-                # Extend from current expiry
-                new_end = current_end + timedelta(days=duration_days)
-            else:
-                # Start from now
-                new_end = datetime.now() + timedelta(days=duration_days)
-        else:
-            # First subscription
-            new_end = datetime.now() + timedelta(days=duration_days)
-        
-        # Update user
-        cursor.execute('''
-        UPDATE users 
-        SET subscription_end = ?, plan_type = ?, status = 'active', total_spent = total_spent + ?
-        WHERE user_id = ?
-        ''', (new_end, plan['name'], plan['price'], user_id))
-        
-        # Log the subscription
-        cursor.execute('''
-        INSERT INTO logs (user_id, action, details)
-        VALUES (?, ?, ?)
-        ''', (user_id, 'subscription_update', 
-              json.dumps({'plan_id': plan_id, 'duration': duration_days, 'new_end': new_end.isoformat()})))
-        
-        conn.commit()
-        conn.close()
-        return True
-    
-    @staticmethod
-    def check_subscription_status(user_id: int):
-        """Check if user has active subscription"""
-        conn = DatabaseUtils.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-        SELECT subscription_end, status 
-        FROM users 
-        WHERE user_id = ?
-        ''', (user_id,))
-        
-        user = cursor.fetchone()
-        conn.close()
-        
-        if not user or user['status'] != 'active':
-            return False
-        
-        if not user['subscription_end']:
-            return False
-        
-        expiry_date = datetime.strptime(user['subscription_end'], '%Y-%m-%d %H:%M:%S')
-        return expiry_date > datetime.now()
-    
-    @staticmethod
-    def get_active_users_count():
-        """Get count of active subscribers"""
-        conn = DatabaseUtils.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-        SELECT COUNT(*) as count 
-        FROM users 
-        WHERE subscription_end > datetime('now') AND status = 'active'
-        ''')
-        
-        result = cursor.fetchone()
-        conn.close()
-        return result['count'] if result else 0
-    
-    @staticmethod
-    def get_pending_payments():
-        """Get pending payments for admin review"""
-        conn = DatabaseUtils.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-        SELECT p.*, u.username, u.first_name, pl.name as plan_name
-        FROM payments p
-        LEFT JOIN users u ON p.user_id = u.user_id
-        LEFT JOIN plans pl ON p.plan_id = pl.id
-        WHERE p.status = 'pending'
-        ORDER BY p.timestamp DESC
-        LIMIT 50
-        ''')
-        
-        payments = cursor.fetchall()
-        conn.close()
-        return [dict(p) for p in payments]
-    
-    @staticmethod
-    def verify_payment(payment_id: int, admin_id: int, approve: bool = True):
-        """Verify a payment"""
-        conn = DatabaseUtils.get_connection()
-        cursor = conn.cursor()
-        
-        # Get payment details
-        cursor.execute('''
-        SELECT p.*, pl.duration_days
-        FROM payments p
-        LEFT JOIN plans pl ON p.plan_id = pl.id
-        WHERE p.id = ?
-        ''', (payment_id,))
-        
-        payment = cursor.fetchone()
-        
-        if not payment:
-            conn.close()
-            return False, "Payment not found"
-        
-        if payment['status'] != 'pending':
-            conn.close()
-            return False, f"Payment already {payment['status']}"
-        
-        if approve:
-            # Update payment status
-            cursor.execute('''
-            UPDATE payments 
-            SET status = 'completed', verified_by = ?, verified_at = ?
-            WHERE id = ?
-            ''', (admin_id, datetime.now(), payment_id))
-            
-            # Update user subscription
-            DatabaseUtils.update_subscription(
-                payment['user_id'], 
-                payment['plan_id'], 
-                payment['duration_days']
-            )
-            
-            # Handle referral commission
-            cursor.execute('''
-            SELECT referred_by FROM users WHERE user_id = ?
-            ''', (payment['user_id'],))
-            
-            referred_by = cursor.fetchone()
-            if referred_by and referred_by['referred_by']:
-                commission = payment['amount'] * Config.REFERRAL_COMMISSION
-                cursor.execute('''
-                UPDATE referrals 
-                SET commission = ?, status = 'completed', completed_at = ?
-                WHERE referred_id = ?
-                ''', (commission, datetime.now(), payment['user_id']))
-            
-            status_msg = "approved"
-        else:
-            # Reject payment
-            cursor.execute('''
-            UPDATE payments 
-            SET status = 'rejected', verified_by = ?, verified_at = ?, notes = 'Rejected by admin'
-            WHERE id = ?
-            ''', (admin_id, datetime.now(), payment_id))
-            status_msg = "rejected"
-        
-        # Log the action
-        cursor.execute('''
-        INSERT INTO logs (user_id, action, details)
-        VALUES (?, ?, ?)
-        ''', (admin_id, 'payment_verification', 
-              json.dumps({'payment_id': payment_id, 'action': status_msg})))
-        
-        conn.commit()
-        conn.close()
-        return True, f"Payment {status_msg} successfully"
-
-class PaymentUtils:
-    """Payment related utilities"""
-    
-    @staticmethod
-    def generate_payment_id(user_id: int, plan_id: int):
-        """Generate unique payment ID"""
-        timestamp = int(datetime.now().timestamp())
-        return f"PAY{user_id:06d}{plan_id:03d}{timestamp % 1000000:06d}"
-    
-    @staticmethod
-    def format_amount(amount: float):
-        """Format amount with currency"""
-        return Config.format_currency(amount)
-    
-    @staticmethod
-    def get_payment_methods():
-        """Get available payment methods"""
-        return Config.PAYMENT_METHODS
-    
-    @staticmethod
-    def get_payment_instructions(method: str, amount: float, user_id: int):
-        """Get payment instructions for specific method"""
-        if method == "upi":
-            return Config.PAYMENT_INSTRUCTIONS["upi"].format(
-                amount=amount,
-                upi_id=Config.UPI_ID,
-                user_id=user_id
-            )
-        elif method == "bank":
-            return Config.PAYMENT_INSTRUCTIONS["bank"].format(
-                amount=amount,
-                user_id=user_id,
-                **Config.BANK_DETAILS
-            )
-        else:
-            return f"Contact support for {method} payment instructions."
-
-class SubscriptionUtils:
-    """Subscription related utilities"""
-    
-    @staticmethod
-    def get_days_remaining(user_id: int):
-        """Get days remaining in subscription"""
-        user = DatabaseUtils.get_user(user_id)
-        if not user or not user['subscription_end']:
-            return 0
-        
-        expiry_date = datetime.strptime(user['subscription_end'], '%Y-%m-%d %H:%M:%S')
-        days_left = (expiry_date - datetime.now()).days
-        return max(0, days_left)
-    
-    @staticmethod
-    def get_expiring_soon_users(days_threshold: int = 3):
-        """Get users whose subscription expires soon"""
-        conn = DatabaseUtils.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-        SELECT user_id, first_name, username, subscription_end
-        FROM users 
-        WHERE subscription_end > datetime('now') 
-        AND subscription_end <= datetime('now', ?)
-        AND status = 'active'
-        ''', (f'+{days_threshold} days',))
-        
-        users = cursor.fetchall()
-        conn.close()
-        return [dict(u) for u in users]
-    
-    @staticmethod
-    def send_expiry_reminders():
-        """Send reminders to users with expiring subscriptions"""
-        users = SubscriptionUtils.get_expiring_soon_users(Config.REMINDER_DAYS_BEFORE_EXPIRE[0])
-        
-        from bot import bot  # Import here to avoid circular import
-        
-        for user in users:
+        """
+        Get a thread-local database connection.
+        Connections are reused within the same thread.
+        """
+        if not hasattr(DatabaseUtils._local, 'connection') or DatabaseUtils._local.connection is None:
             try:
-                days_left = SubscriptionUtils.get_days_remaining(user['user_id'])
-                bot.send_message(
-                    user['user_id'],
-                    f"⚠️ *SUBSCRIPTION REMINDER*\n\n"
-                    f"Your subscription expires in {days_left} days.\n"
-                    f"Renew now to avoid interruption in service.\n\n"
-                    f"*Expiry Date:* {user['subscription_end'][:10]}",
-                    parse_mode='Markdown'
+                # Create new connection with appropriate settings
+                conn = sqlite3.connect(
+                    DB_PATH,
+                    check_same_thread=False,
+                    timeout=30,
+                    detect_types=sqlite3.PARSE_DECLTYPES
                 )
-            except Exception as e:
-                logger.error(f"Failed to send reminder to {user['user_id']}: {e}")
 
-class AdminUtils:
-    """Admin utility functions"""
+                # allow row access by column name (so handlers can use row['name'])
+                conn.row_factory = sqlite3.Row
+                
+                # Enable WAL mode for better concurrency
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA busy_timeout=5000")
+                
+                DatabaseUtils._local.connection = conn
+                logger.debug(f"Created new database connection for thread {threading.current_thread().name}")
+                
+            except Exception as e:
+                logger.error(f"Failed to create database connection: {e}")
+                raise
+        
+        return DatabaseUtils._local.connection
     
     @staticmethod
-    def get_system_stats():
-        """Get comprehensive system statistics"""
-        conn = DatabaseUtils.get_connection()
-        cursor = conn.cursor()
-        
-        stats = {}
-        
-        # User stats
-        cursor.execute("SELECT COUNT(*) as total FROM users")
-        stats['total_users'] = cursor.fetchone()['total']
-        
-        cursor.execute("SELECT COUNT(*) as active FROM users WHERE subscription_end > datetime('now')")
-        stats['active_users'] = cursor.fetchone()['active']
-        
-        cursor.execute("SELECT COUNT(*) as today FROM users WHERE DATE(join_date) = DATE('now')")
-        stats['new_today'] = cursor.fetchone()['today']
-        
-        # Payment stats
-        cursor.execute("SELECT SUM(amount) as total FROM payments WHERE status = 'completed'")
-        stats['total_revenue'] = cursor.fetchone()['total'] or 0
-        
-        cursor.execute("SELECT SUM(amount) as today FROM payments WHERE status = 'completed' AND DATE(timestamp) = DATE('now')")
-        stats['today_revenue'] = cursor.fetchone()['today'] or 0
-        
-        cursor.execute("SELECT COUNT(*) as pending FROM payments WHERE status = 'pending'")
-        stats['pending_payments'] = cursor.fetchone()['pending']
-        
-        # Plan stats
-        cursor.execute("SELECT COUNT(*) as total FROM plans WHERE is_active = 1")
-        stats['active_plans'] = cursor.fetchone()['total']
-        
-        conn.close()
-        return stats
-    
-    @staticmethod
-    def export_data(data_type: str = 'users'):
-        """Export data as CSV"""
-        conn = DatabaseUtils.get_connection()
-        cursor = conn.cursor()
-        
-        if data_type == 'users':
-            cursor.execute('''
-            SELECT user_id, username, first_name, plan_type, subscription_end, 
-                   status, total_spent, last_active
-            FROM users
-            ORDER BY join_date DESC
-            ''')
-            filename = f"users_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            headers = ['User ID', 'Username', 'First Name', 'Plan', 'Subscription End', 
-                      'Status', 'Total Spent', 'Last Active']
-        
-        elif data_type == 'payments':
-            cursor.execute('''
-            SELECT p.id, p.user_id, u.username, p.amount, p.payment_method, 
-                   p.status, p.timestamp, p.verified_by
-            FROM payments p
-            LEFT JOIN users u ON p.user_id = u.user_id
-            ORDER BY p.timestamp DESC
-            ''')
-            filename = f"payments_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            headers = ['Payment ID', 'User ID', 'Username', 'Amount', 'Method', 
-                      'Status', 'Timestamp', 'Verified By']
-        
-        else:
-            conn.close()
-            return None, "Invalid data type"
-        
-        data = cursor.fetchall()
-        conn.close()
-        
-        # Create CSV content
-        csv_lines = [','.join(headers)]
-        for row in data:
-            csv_lines.append(','.join([str(r) for r in row]))
-        
-        csv_content = '\n'.join(csv_lines)
-        
-        # Save to file
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(csv_content)
-        
-        return filename, csv_content
-    
-    @staticmethod
-    def broadcast_message(message: str, user_ids: List[int] = None):
-        """Broadcast message to users"""
-        from bot import bot
-        
-        if not user_ids:
-            # Get all active users
-            conn = DatabaseUtils.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id FROM users WHERE status = 'active'")
-            user_ids = [row['user_id'] for row in cursor.fetchall()]
-            conn.close()
-        
-        success = 0
-        failed = 0
-        
-        for user_id in user_ids:
+    def close_connection():
+        """Close the thread-local connection."""
+        if hasattr(DatabaseUtils._local, 'connection') and DatabaseUtils._local.connection is not None:
             try:
-                bot.send_message(user_id, message, parse_mode='Markdown')
-                success += 1
+                DatabaseUtils._local.connection.close()
+                DatabaseUtils._local.connection = None
+                logger.debug(f"Closed database connection for thread {threading.current_thread().name}")
             except Exception as e:
-                logger.error(f"Failed to send to {user_id}: {e}")
-                failed += 1
-        
-        return success, failed
-
-class BackupUtils:
-    """Database backup utilities"""
+                logger.error(f"Failed to close database connection: {e}")
     
     @staticmethod
-    def create_backup():
-        """Create database backup"""
-        backup_file = f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
-        
+    @contextmanager
+    def get_cursor():
+        """
+        Context manager for database operations.
+        Usage:
+        with DatabaseUtils.get_cursor() as cursor:
+            cursor.execute("SELECT ...")
+        """
+        conn = DatabaseUtils.get_connection()
+        cursor = conn.cursor()
         try:
-            # Simple copy for SQLite
-            import shutil
-            shutil.copy2(Config.DATABASE_NAME, backup_file)
-            
-            # Compress backup
-            import gzip
-            with open(Config.DATABASE_NAME, 'rb') as f_in:
-                with gzip.open(f"{backup_file}.gz", 'wb') as f_out:
-                    shutil.copyfileobj(f_in, f_out)
-            
-            os.remove(backup_file)  # Remove uncompressed backup
-            return f"{backup_file}.gz"
-            
-        except Exception as e:
-            logger.error(f"Backup failed: {e}")
-            return None
+            yield cursor
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cursor.close()
+            # DO NOT close connection here - it's managed by thread-local
     
     @staticmethod
-    def cleanup_old_backups(max_backups: int = 10):
-        """Remove old backup files"""
-        import glob
+    def init_database():
+        """Initialize database with correct schema (users, plans, payments, channels)."""
+        with DatabaseUtils.get_cursor() as cursor:
+            # Users table (matching bot.py schema)
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                name TEXT,
+                join_date TEXT,
+                expiry_date TEXT,
+                plan TEXT DEFAULT 'free',
+                status TEXT DEFAULT 'active',
+                last_active TEXT,
+                plan_type TEXT,
+                subscription_end TEXT
+            )
+            ''')
+            
+            # Plans table (matching bot.py schema)
+            # Note: include columns used by handlers: id, name, price, duration_days, description, is_active
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS plans (
+                id INTEGER PRIMARY KEY,
+                name TEXT,
+                duration_days INTEGER,
+                price INTEGER,
+                description TEXT,
+                features TEXT,
+                is_active INTEGER DEFAULT 1,
+                currency TEXT DEFAULT 'INR'
+            )
+            ''')
+            
+            # Payments table (matching bot.py schema)
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                plan_id INTEGER,
+                amount INTEGER,
+                currency TEXT,
+                payment_method TEXT,
+                status TEXT DEFAULT 'pending',
+                timestamp TEXT,
+                transaction_id TEXT
+            )
+            ''')
+            
+            # Channels table (new)
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id TEXT UNIQUE NOT NULL,   -- stores @username or numeric id as text
+                title TEXT,
+                added_by INTEGER,
+                added_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            
+            # Referrals table (used by handlers)
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS referrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                referrer_id INTEGER,
+                referee_id INTEGER,
+                commission INTEGER DEFAULT 0,
+                timestamp TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            
+            # Insert default plans if not present
+            cursor.execute("SELECT COUNT(*) FROM plans")
+            if cursor.fetchone()[0] == 0:
+                plans = [
+                    (1, '⭐ BASIC - 1 Week', 7, 49,
+                     'Weekly access to private channel',
+                     '✅ Channel Access\n✅ Basic Support\n✅ Weekly Updates', 1, 'INR'),
+                    
+                    (2, '🚀 PRO - 1 Month', 30, 199,
+                     'Monthly access with priority support',
+                     '✅ Channel Access\n✅ Priority Support\n✅ Daily Updates\n✅ HD Content', 1, 'INR'),
+                    
+                    (3, '🔥 PREMIUM - 3 Months', 90, 399,
+                     '3 months access + bonus content',
+                     '✅ Channel Access\n✅ Priority Support\n✅ All Updates\n✅ Bonus Content\n✅ 4K Quality', 1, 'INR'),
+                    
+                    (4, '👑 LIFETIME', 36500, 1999,
+                     'Lifetime access + all future updates',
+                     '✅ Lifetime Access\n✅ VIP Support\n✅ All Content\n✅ Future Updates\n✅ Special Badge\n✅ Early Access', 1, 'INR')
+                ]
+                cursor.executemany('INSERT INTO plans (id, name, duration_days, price, description, features, is_active, currency) VALUES (?,?,?,?,?,?,?,?)', plans)
         
-        backup_files = sorted(glob.glob("backup_*.db.gz"), key=os.path.getmtime)
-        
-        if len(backup_files) > max_backups:
-            for old_backup in backup_files[:-max_backups]:
-                try:
-                    os.remove(old_backup)
-                    logger.info(f"Removed old backup: {old_backup}")
-                except Exception as e:
-                    logger.error(f"Failed to remove {old_backup}: {e}")
+        logger.info("Database initialized successfully")
 
-# Shortcut functions
-def check_subscription_status(user_id: int, cursor=None):
-    """Check if user has active subscription (compatible with old code)"""
-    if cursor:
-        # Using provided cursor
-        cursor.execute('''
-        SELECT subscription_end, status 
-        FROM users 
-        WHERE user_id = ?
-        ''', (user_id,))
-        
-        user = cursor.fetchone()
-        
-        if not user or user['status'] != 'active':
+# ==================== CHANNELS: CRUD FUNCTIONS ====================
+
+def add_channel(channel_id: str, title: Optional[str] = None, added_by: Optional[int] = None) -> bool:
+    """
+    Add a channel to channels table.
+    channel_id: '@username' or string of numeric id
+    title: optional human-friendly title
+    added_by: user id of admin who added
+    Returns True if inserted, False if already exists or error.
+    """
+    try:
+        with DatabaseUtils.get_cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO channels (channel_id, title, added_by) VALUES (?, ?, ?)",
+                (channel_id, title, added_by)
+            )
+        logger.info(f"Channel {channel_id} added by {added_by}")
+        return True
+    except sqlite3.IntegrityError:
+        # already exists (unique constraint)
+        logger.debug(f"Attempted to add existing channel {channel_id}")
+        return False
+    except Exception as e:
+        logger.error(f"Error adding channel {channel_id}: {e}")
+        return False
+
+def remove_channel(channel_id: str) -> bool:
+    """
+    Remove channel by exact channel_id. Returns True if deleted, False if not found or error.
+    """
+    try:
+        with DatabaseUtils.get_cursor() as cursor:
+            cursor.execute("DELETE FROM channels WHERE channel_id = ?", (channel_id,))
+            deleted = cursor.rowcount > 0
+        if deleted:
+            logger.info(f"Channel {channel_id} removed")
+        else:
+            logger.debug(f"Channel {channel_id} not found for deletion")
+        return deleted
+    except Exception as e:
+        logger.error(f"Error removing channel {channel_id}: {e}")
+        return False
+
+def list_channels() -> List[Tuple[int, str, Optional[str]]]:
+    """
+    Return list of channels as tuples (id, channel_id, title).
+    """
+    try:
+        with DatabaseUtils.get_cursor() as cursor:
+            cursor.execute("SELECT id, channel_id, title FROM channels ORDER BY id")
+            rows = cursor.fetchall()
+        # convert sqlite3.Row to plain tuples for callers
+        return [(r['id'], r['channel_id'], r['title']) for r in rows]
+    except Exception as e:
+        logger.error(f"Error listing channels: {e}")
+        return []
+
+def get_channel(channel_id: str) -> Optional[Tuple[int, str, Optional[str]]]:
+    """
+    Return single channel row (id, channel_id, title) or None.
+    """
+    try:
+        with DatabaseUtils.get_cursor() as cursor:
+            cursor.execute("SELECT id, channel_id, title FROM channels WHERE channel_id = ?", (channel_id,))
+            row = cursor.fetchone()
+        if row:
+            return (row['id'], row['channel_id'], row['title'])
+        return None
+    except Exception as e:
+        logger.error(f"Error fetching channel {channel_id}: {e}")
+        return None
+
+# ==================== EXISTING FUNCTIONS (compat) ====================
+
+def has_active_subscription(user_id):
+    """Check if user has active subscription."""
+    try:
+        with DatabaseUtils.get_cursor() as cursor:
+            cursor.execute("SELECT expiry_date FROM users WHERE user_id = ?", (user_id,))
+            result = cursor.fetchone()
+            
+            if result and result[0]:
+                expiry = datetime.strptime(result[0], '%Y-%m-%d %H:%M:%S')
+                return expiry > datetime.now()
             return False
-        
-        if not user['subscription_end']:
-            return False
-        
-        expiry_date = datetime.strptime(user['subscription_end'], '%Y-%m-%d %H:%M:%S')
-        return expiry_date > datetime.now()
-    else:
-        # Use DatabaseUtils
-        return DatabaseUtils.check_subscription_status(user_id)
+    except Exception as e:
+        logger.error(f"Error checking subscription for user {user_id}: {e}")
+        return False
 
-def format_time_remaining(seconds: int):
-    """Format time remaining in human readable format"""
-    if seconds < 60:
-        return f"{seconds} seconds"
-    elif seconds < 3600:
-        return f"{seconds//60} minutes"
-    elif seconds < 86400:
-        return f"{seconds//3600} hours"
-    else:
-        return f"{seconds//86400} days"
+def add_subscription(user_id, plan_id, days):
+    """Add subscription to user."""
+    try:
+        with DatabaseUtils.get_cursor() as cursor:
+            # Get plan details
+            cursor.execute("SELECT name FROM plans WHERE id = ?", (plan_id,))
+            result = cursor.fetchone()
+            if not result:
+                logger.error(f"Plan {plan_id} not found")
+                return False
+            
+            plan_name = result['name'] if isinstance(result, sqlite3.Row) else result[0]
+            
+            # Calculate expiry
+            new_expiry = datetime.now() + timedelta(days=days)
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Check if user exists
+            cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+            if cursor.fetchone():
+                # Update existing user
+                cursor.execute('''
+                UPDATE users 
+                SET plan = ?, expiry_date = ?, status = 'active', last_active = ?
+                WHERE user_id = ?
+                ''', (plan_name, new_expiry.strftime('%Y-%m-%d %H:%M:%S'), current_time, user_id))
+            else:
+                # Insert new user
+                cursor.execute('''
+                INSERT INTO users (user_id, username, name, join_date, expiry_date, plan, status, last_active)
+                VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
+                ''', (user_id, '', '', current_time, 
+                      new_expiry.strftime('%Y-%m-%d %H:%M:%S'), plan_name, current_time))
+            
+            logger.info(f"Subscription added for user {user_id}, plan {plan_name}, {days} days")
+            return True
+            
+    except Exception as e:
+        logger.error(f"Error adding subscription for user {user_id}: {e}")
+        return False
 
-def generate_referral_code(user_id: int):
-    """Generate referral code for user"""
-    import random
-    import string
+# ==================== BOT.PY COMPATIBILITY ====================
+
+def get_db():
+    """
+    Compatibility function for bot.py.
+    Returns a database connection (do NOT close it).
+    """
+    return DatabaseUtils.get_connection()
+
+# ==================== TEST FUNCTION ====================
+
+def test_connection():
+    """Test database connection."""
+    print("🧪 Testing database connection...")
     
-    chars = string.ascii_uppercase + string.digits
-    random_part = ''.join(random.choice(chars) for _ in range(6))
-    return f"REF{user_id}{random_part}"
+    try:
+        # Initialize database
+        DatabaseUtils.init_database()
+        
+        # Test with context manager
+        with DatabaseUtils.get_cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM plans")
+            count = cursor.fetchone()[0]
+            print(f"✅ Found {count} plans in database")
+        
+        # Test channels table
+        with DatabaseUtils.get_cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM channels")
+            ccount = cursor.fetchone()[0]
+            print(f"✅ Found {ccount} channels in database")
+        
+        # Test has_active_subscription
+        print(f"✅ has_active_subscription(123): {has_active_subscription(123)}")
+        
+        print("✅ All tests passed!")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Test failed: {e}")
+        return False
 
-def validate_email(email: str):
-    """Simple email validation"""
-    import re
-    pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-    return re.match(pattern, email) is not None
-
-def format_user_display(user):
-    """Format user for display"""
-    name = user.get('first_name', 'User')
-    username = f" (@{user['username']})" if user.get('username') else ""
-    return f"{name}{username}"
+if __name__ == "__main__":
+    test_connection()
